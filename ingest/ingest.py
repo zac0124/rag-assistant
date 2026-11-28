@@ -2,139 +2,183 @@
 #  splits pages into chunks, flags chunks that contain warnings, embeds them, and uploads them:
 
 import glob, os, re, fitz
+
 from backend.common import *
-from azure.search.documents.indexes.models import (SearchIndex, SimpleField,
-SearchableField, SearchField,
-SearchFieldDataType, VectorSearch, HnswAlgorithmConfiguration,
-VectorSearchProfile,
-SemanticConfiguration, SemanticPrioritizedFields, SemanticField,
-SemanticSearch)
+
+
+from azure.search.documents.indexes.models import (
+    SearchIndex,
+    SimpleField,
+    SearchableField,
+    SearchField,
+    SearchFieldDataType,
+    VectorSearch,
+    HnswAlgorithmConfiguration,
+    VectorSearchProfile,
+    SemanticConfiguration,
+    SemanticPrioritizedFields,
+    SemanticField,
+    SemanticSearch,
+)
 
 
 def make_index():
-    # Create a new index with vector search and semantic search enabled
+    """Create the search index, or update it if it already exists."""
+
     fields = [
+        # Unique ID for each chunk. Every index needs exactly one key field.
         SimpleField(name="id", type=SearchFieldDataType.String, key=True),
+
+        # The chunk text. SearchableField means Azure can do keyword search on it.
         SearchableField(name="content", type=SearchFieldDataType.String),
+
+        # Which PDF the chunk came from. filterable lets you filter by manual.
         SimpleField(name="manual", type=SearchFieldDataType.String, filterable=True),
-        SearchableField(name="page", type=SearchFieldDataType.Int32, filterable=True),
-        SearchableField(name="has_warning", type=SearchFieldDataType.Boolean, filterable=True),
-        SearchableField(name="embedding", type=SearchFieldDataType.Collection(SearchFieldDataType.Single), vector_search_dimensions=1536, vector_search_profile_name="vec"),
+
+        # The page number. Numbers use SimpleField, not SearchableField,
+        # because SearchableField only works for text.
+        SimpleField(name="page", type=SearchFieldDataType.Int32, filterable=True),
+
+        # True if the chunk mentions a warning, caution or danger.
+        SimpleField(name="has_warning", type=SearchFieldDataType.Boolean, filterable=True),
+
+        # The embedding: a list of 1536 decimal numbers, the size that
+        # text-embedding-3-small produces. The vector field must use SearchField
+        # with searchable=True, and it points to the "vec" profile defined below.
+        SearchField(
+            name="embedding",
+            type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+            searchable=True,
+            vector_search_dimensions=1536,
+            vector_search_profile_name="vec",
+        ),
     ]
 
-    vs = VectorSearch(
-        algorithm_configurations=[
-            HnswAlgorithmConfiguration(name="hnsw")], profile=VectorSearchProfile(name="vec", vector_search_algorithm_configuration_name="hnsw"))
+    # Vector search settings. "algorithms" lists the search methods available
+    # (HNSW is a fast way to find similar vectors). "profiles" gives names to
+    # the combinations that fields can use.
+    vector_search = VectorSearch(
+        algorithms=[HnswAlgorithmConfiguration(name="hnsw")],
+        profiles=[VectorSearchProfile(name="vec", algorithm_configuration_name="hnsw")],
+    )
 
-    sem = SemanticSearch(
+    # Semantic search settings. This lets Azure re-rank results by meaning,
+    # looking at the "content" field.
+    semantic_search = SemanticSearch(
         configurations=[
             SemanticConfiguration(
                 name="sem",
                 prioritized_fields=SemanticPrioritizedFields(
                     content_fields=[SemanticField(field_name="content")],
-                )
-            )])
+                ),
+            )
+        ]
+    )
 
-    index_client.create_or_update_index = SearchIndex(
-        name=os.environ['SEARCH_INDEX'],
-        fields=fields,
-        vector_search=vs,
-        semantic_search=sem)
+    # This is a function CALL: the index definition goes inside the parentheses.
+    # If it were written with "=", nothing would be sent to Azure.
+    index_client.create_or_update_index(
+        SearchIndex(
+            name=os.environ["SEARCH_INDEX"],
+            fields=fields,
+            vector_search=vector_search,
+            semantic_search=semantic_search,
+        )
+    )
+    print("Index is ready:", os.environ["SEARCH_INDEX"])
 
 
 def chunk_text(text, max_length=1000):
-    # Split the text into chunks of max_length characters, trying to split at sentence boundaries
-    sentences = re.split(r'(?<=[.!?]) +', text)
+    """Split text into chunks of at most max_length characters,
+    breaking at the end of sentences where possible."""
+
+    # Split after ., ! or ? when followed by spaces.
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+
     chunks = []
-    current_chunk = ""
+    current = ""
+
     for sentence in sentences:
-        if len(current_chunk) + len(sentence) <= max_length:
-            current_chunk += sentence + " "
+        # A single sentence longer than max_length is cut into pieces,
+        # otherwise it would make a chunk that is too big.
+        while len(sentence) > max_length:
+            if current.strip():
+                chunks.append(current.strip())
+                current = ""
+            chunks.append(sentence[:max_length].strip())
+            sentence = sentence[max_length:]
+
+        # If the sentence still fits in the current chunk, add it.
+        if len(current) + len(sentence) + 1 <= max_length:
+            current += sentence + " "
         else:
-            chunks.append(current_chunk.strip())
-            current_chunk = sentence + " "
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-    return chunks
+            # Otherwise save the current chunk and start a new one.
+            if current.strip():
+                chunks.append(current.strip())
+            current = sentence + " "
+
+    # Save the last chunk.
+    if current.strip():
+        chunks.append(current.strip())
+
+    # Remove empty chunks. Embedding an empty string causes an error.
+    return [c for c in chunks if c]
+
 
 def main():
-
-    # Create or prepare the search index
+    # Step 1: make sure the index exists before uploading anything.
     make_index()
 
-    # Empty list to store all document chunks
+    # Step 2: read the PDFs and build a list of chunk documents.
     docs = []
 
-    # Find all PDF files inside the manuals folder
-    for path in glob.glob("manuals/*.pdf"):
+    # Find every PDF in the manuals folder (relative to where you run the script).
+    pdf_paths = glob.glob("manuals/*.pdf")
+    print(f"Found {len(pdf_paths)} PDF file(s)")
 
-        # Get just the PDF filename
-        manual = os.path.basename(path)
+    for path in pdf_paths:
+        manual = os.path.basename(path)  # just the file name, e.g. "guide.pdf"
 
-        # Open the PDF and read each page
         with fitz.open(path) as pdf:
-
-            for pno, page in enumerate(pdf, start=1):
-
-                # Extract text from the current page
+            # enumerate(..., start=1) numbers the pages from 1, like a human would.
+            for page_number, page in enumerate(pdf, start=1):
                 page_text = page.get_text()
 
-                # Split the page text into smaller chunks
-                for n, c in enumerate(chunk_text(page_text)):
-
-                    # Create a document with its information
+                for n, chunk in enumerate(chunk_text(page_text)):
                     docs.append({
-
-                        # Create a unique ID for each chunk
-                        "id": re.sub(
-                            r"[^A-Za-z0-9-]",
-                            "",
-                            f"{manual}-{pno}-{n}"
-                        ),
-
-                        # Actual text content
-                        "content": c,
-
-                        # Original PDF filename
+                        # Keep only letters, digits and dashes: Azure keys only
+                        # allow letters, digits, _, - and =.
+                        "id": re.sub(r"[^A-Za-z0-9-]", "", f"{manual}-{page_number}-{n}"),
+                        "content": chunk,
                         "manual": manual,
-
-                        # Original PDF page number
-                        "page": pno,
-
-                        # Check whether the chunk contains safety words
+                        "page": page_number,
+                        # \b means a word boundary, so "warning" matches but
+                        # "forewarning" does not. re.I ignores upper/lower case.
                         "has_warning": bool(
-                            re.search(
-                                r"\bwarning\b|\bcaution\b|\bdanger\b",
-                                c,
-                                re.I
-                            )
-                        )
+                            re.search(r"\bwarning\b|\bcaution\b|\bdanger\b", chunk, re.I)
+                        ),
                     })
 
+    print(f"Created {len(docs)} chunks")
 
-    # Process 16 chunks at a time
+    # Step 3: embed and upload in batches of 16, to keep each request small.
     for i in range(0, len(docs), 16):
-
-        # Get the next 16 documents
         batch = docs[i:i + 16]
 
-        # Extract text from each document and generate embeddings
+        # One call to Azure OpenAI gives back one embedding per chunk, in order.
         embeddings = embed([d["content"] for d in batch])
 
-        # Add each embedding to its matching document
-        for d, v in zip(batch, embeddings):
-
-            d["embedding"] = v
-
+        # zip pairs each document with its matching embedding.
+        for doc, vector in zip(batch, embeddings):
+            doc["embedding"] = vector
 
         search_client.upload_documents(batch)
-
         print(f"Uploaded {len(batch)} documents")
 
-    # Display total number of chunks processed
-    print("Uploaded", len(docs), "chunks")
+    print("Done. Uploaded", len(docs), "chunks in total")
 
 
-
-
-main()
+# This line runs main() only when you start this file directly,
+# not when another file imports it.
+if __name__ == "__main__":
+    main()

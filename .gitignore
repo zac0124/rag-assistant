@@ -1,3 +1,13 @@
+
+.env
+.venv/
+manuals/
+
+__pycache
+__
+/
+
+
 # Miscellaneous
 *.class
 *.lock

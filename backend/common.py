@@ -12,13 +12,19 @@ load_dotenv()
 
 E = os.environ
 
-oai = AzureOpenAI(azure_endpoint=E['AZURE_OPENAI_ENDPOINT'] )
-api_key = E['AZURE_OPENAI_API_KEY']
-api_version = E['AZURE_OPENAI_API_VERSION']
-cred = AzureKeyCredential(E['SEARCH_kEY'])
+oai = AzureOpenAI(
+    azure_endpoint=E['AZURE_OPENAI_ENDPOINT'],  # https://<resource>.openai.azure.com/
+    api_version=E['AZURE_OPENAI_API_VERSION'],  # e.g. 2024-10-21
+    api_key=E['AZURE_OPENAI_API_KEY'],          # plain string
+)
+
+cred = AzureKeyCredential(E['SEARCH_KEY'])      # Search wants the wrapper
 search_client = SearchClient(endpoint=E['SEARCH_ENDPOINT'], index_name=E['SEARCH_INDEX'], credential=cred)
 index_client = SearchIndexClient(endpoint=E['SEARCH_ENDPOINT'], credential=cred)
 
+EMBED_MODEL = E['EMBED_DEPLOYMENT']  #  =deployment name
+
+
 def embed(texts):
-    out = oai.embeddings.create(model=E['EMBED_DEPLOYMENT'], input=texts)
+    out = oai.embeddings.create(input=texts, model=EMBED_MODEL)
     return [e.embedding for e in out.data]
